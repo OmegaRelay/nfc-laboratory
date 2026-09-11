@@ -65,14 +65,18 @@ TYPE_COLORS = {
     "CarrierOff": Colors.RED,
 }
 
+prevFrame: NFCFrame = None
+
 
 def format_frame(frame: NFCFrame) -> str:
     """Format a single frame for display"""
+    global prevFrame
     tech_color = TECH_COLORS.get(frame.tech, Colors.RESET)
     type_color = TYPE_COLORS.get(frame.type, Colors.RESET)
 
     # Detect protocol command
-    command = detect_command(frame)
+    command = detect_command(frame, prevFrame)
+    prevFrame = frame
 
     # Build output with consistent column widths
     output = f"[{Colors.BOLD}{frame.timestamp:>12.6f}{Colors.RESET}] "

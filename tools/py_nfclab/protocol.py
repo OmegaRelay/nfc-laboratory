@@ -16,7 +16,7 @@ cannot be reliably identified without context from previous Poll frames.
 from dataclasses import dataclass
 from typing import Optional
 
-from .models import NFCFrame
+from .models import NFCFrame, FrameFlags
 
 # =============================================================================
 # Protocol Command Tables
@@ -28,13 +28,18 @@ NFC_A_COMMANDS = {
     0x26: "REQA",
     0x52: "WUPA",
     0xE0: "RATS",
+    0x50: "HLTA",
+    # ECP
+    0x6a: "VASUP-A",
     # Ultralight/NTAG commands
     0x30: "READ",
     0x3A: "FAST_READ",
     0x39: "READ_CNT",
     0x3C: "READ_SIG",
+    0x3E: "TEARING", # MIFARE Ultralight EV1
+    0x4B: "VCSL", # MIFARE Ultralight EV1
     0x60: "GET_VERSION",  # NTAG/Ultralight EV1
-    0xA0: "COMPAT_WRITE",  # Ultralight compatibility write
+    0xA0: "COMP_WRITE",  # Ultralight compatibility write
     0xA2: "WRITE",
     0xA5: "INCR_CNT",
     0x1A: "AUTH",  # Ultralight C
@@ -46,12 +51,25 @@ NFC_A_COMMANDS = {
     0xC2: "RESTORE",
 }
 
+NFC_A_RESPONSES = {
+    0x26: "ATQA",
+    0x52: "ATQA",
+}
+
 # NFC-B Commands (ISO/IEC 14443-B)
 NFC_B_COMMANDS = {
-    0x05: "REQB",
-    0x08: "WUPB",
-    0x1D: "ATTRIB",
-    0x50: "HLTB",
+   0x05: "REQB",
+   0x06: "INIT",
+   0x08: "READ",
+   0x09: "WRITE",
+   0x0B: "GET_UID",
+   0x0E: "SELECT",
+   0x1d: "ATTRIB",
+   0x50: "HLTB",
+}
+
+NFC_B_RESPONSES = {
+   0x05: "ATQB",
 }
 
 # NFC-F Commands (FeliCa / JIS X 6319-4)
@@ -744,8 +762,106 @@ def parse_nfcv_request(frame: NFCFrame) -> Optional[NfcVRequest]:
 
     return NfcVRequest(flags=flags, cmd=cmd, uid=uid, params=params, crc=crc)
 
+def detect_isodep_command(frame: NFCFrame) ->Optional[str]:
+    command = frame.data[0]
+    length = len(frame.data)
 
-def detect_command(frame: NFCFrame) -> Optional[str]:
+    # ISO-DEP protocol S(Deselect)
+    if ((command & 0xF7) == 0xC2 and length >= 3 and length <= 4):
+        return "S(Deselect)"
+
+    # ISO-DEP protocol S(WTX)
+    if ((command & 0xF7) == 0xF2 and length >= 3 and length <= 4):
+        return "S(WTX)"
+
+    # ISO-DEP protocol R(ACK)
+    if ((command & 0xF6) == 0xA2 and length == 3):
+        return "R(ACK)"
+
+    # ISO-DEP protocol R(NACK)
+    if ((command & 0xF6) == 0xB2 and length == 3):
+        return "R(NACK)"
+
+    # ISO-DEP protocol I-Block
+    if ((command & 0xE6) == 0x02 and length >= 4):
+        return "I-Block"
+
+    # ISO-DEP protocol R-Block
+    if ((command & 0xE6) == 0xA2 and length == 3):
+        return "R-Block"
+
+    # ISO-DEP protocol S-Block
+    if ((command & 0xC7) == 0xC2 and length >= 3 and length <= 4):
+        return "S-Block"
+
+    return None
+
+
+def detect_nfca_command(frame: NFCFrame, prev: NFCFrame|None) ->Optional[str]:
+
+    result = None
+
+    # skip encrypted frames
+    if frame.has_flag(FrameFlags.Encrypted):
+        return result
+
+    if frame.is_poll():
+        data, _ = _strip_crc_if_present(frame.data)
+        length = len(data)
+        cmd = data[0]
+
+        # Protocol Parameter Selection
+        if cmd == 0x50 and length == 4:
+           return "HALT"
+
+        # Protocol Parameter Selection
+        if (cmd & 0xF0) == 0xD0 and length == 5:
+            return "PPS"
+
+        if cmd in {0x93, 0x95, 0x97}:
+            level = {0x93: "1", 0x95: "2", 0x97: "3"}[cmd]
+            nvb = data[1]
+            if nvb == 0x70:
+                return f"SEL{level}"
+            if (nvb & 0xF0) == 0x20:
+                return f"ANTICOLLISION{level}"
+
+        result = detect_isodep_command(frame)
+        if result is not None:
+            return result
+        return NFC_A_COMMANDS.get(cmd)
+
+    elif prev is not None and prev.is_poll():
+        data, _ = _strip_crc_if_present(prev.data)
+        length = len(data)
+        cmd = prev.data[0]
+
+        if (cmd == 0x93 or cmd == 0x95 or cmd == 0x97):
+            if (length == 3):
+                return "SAK"
+
+            if (length == 5):
+                return "UID"
+
+        if cmd == 0xE0 and frame.data[0] == (frame.length - 2):
+           return "ATS"
+
+        if cmd in {0x93, 0x95, 0x97}:
+            level = {0x93: "1", 0x95: "2", 0x97: "3"}[cmd]
+            nvb = data[1]
+            if nvb == 0x70:
+                return f"SAK{level}"
+            if (nvb & 0xF0) == 0x20:
+                return f"UID{level}"
+
+        result = detect_isodep_command(frame)
+        if result is not None:
+           return result;
+        return NFC_A_RESPONSES.get(cmd)
+
+    return None
+
+def detect_command(frame: NFCFrame, prevFrame: NFCFrame|None = None) -> Optional[str]:
     """
     Detect protocol command name from frame data.
 
@@ -778,37 +894,7 @@ def detect_command(frame: NFCFrame) -> Optional[str]:
 
     # NFC-A: Special cases first, then table lookup
     if frame.tech == "NfcA":
-        cmd = data[0]
-
-        # HLTA (0x50 0x00) - must check second byte to distinguish from HLTB
-        if cmd == 0x50 and length >= 2 and data[1] == 0x00:
-            result = "HLTA"
-
-        # AUTH_A/AUTH_B (MIFARE Classic) - conflicts with GET_VERSION (0x60)
-        # Heuristic: length > 2 → AUTH, else GET_VERSION
-        elif cmd == 0x60 and length >= 2:
-            result = "AUTH_A" if length > 2 else NFC_A_COMMANDS.get(cmd)
-        elif cmd == 0x61 and length >= 2:
-            result = "AUTH_B"
-
-        # PPS (0xD0-0xDF) - PPSS + PPS0 minimum, optional PPS1/PPS2/PPS3/CID
-        elif (cmd & 0xF0) == 0xD0 and length >= 2:
-            result = "PPS"
-
-        # Cascade levels (0x93/0x95/0x97) - NVB determines mode
-        elif cmd in (0x93, 0x95, 0x97) and length >= 2:
-            level = {0x93: "1", 0x95: "2", 0x97: "3"}[cmd]
-            nvb = data[1]
-            if nvb == 0x70:
-                result = f"SELECT{level}"
-            elif (nvb & 0xF0) == 0x20:
-                result = f"ANTICOLLISION{level}"
-            else:
-                result = f"SEL{level}"
-
-        # Table lookup for remaining commands
-        else:
-            result = NFC_A_COMMANDS.get(cmd)
+        result = detect_nfca_command(frame, prevFrame)
 
     # NFC-B: Table lookup, then SLOT_MARKER for Poll frames
     elif frame.tech == "NfcB":
@@ -857,26 +943,6 @@ def detect_command(frame: NFCFrame) -> Optional[str]:
         and frame.tech in ("NfcA", "NfcB")
         and (frame.is_poll() or frame.is_listen())
     ):
-        pcb = data[0]
-
-        # S(DESELECT): PCB 0xC2/0xCA
-        if (pcb & 0xF7) == 0xC2:
-            return "S(DESELECT)"
-
-        # S(WTX): PCB 0xF2/0xFA
-        if (pcb & 0xF7) == 0xF2:
-            return "S(WTX)"
-
-        # R(ACK): bit 4 = 0
-        if (pcb & 0xE6) == 0xA2:
-            return "R(ACK)"
-
-        # R(NACK): bit 4 = 1
-        if (pcb & 0xE6) == 0xB2:
-            return "R(NACK)"
-
-        # I-Block: bit 7 = 0
-        if (pcb & ISO_DEP_I_BLOCK_MASK) == 0x00:
-            return "I-Block"
+        result = detect_isodep_command(frame)
 
     return result
